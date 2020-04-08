@@ -25,6 +25,8 @@ import torchvision.models as models
 import moco.loader
 import moco.builder
 
+import numpy as np
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -97,6 +99,11 @@ parser.add_argument('--aug-plus', action='store_true',
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
+parser.add_argument('--pretrained', default='', type=str,
+                    help='path to moco pretrained checkpoint')
+
+parser.add_argument('--name', default='', type=str,
+                    help='path to moco pretrained checkpoint')
 
 def main():
     args = parser.parse_args()
@@ -145,49 +152,40 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
 
-    if args.distributed:
-        if args.dist_url == "env://" and args.rank == -1:
-            args.rank = int(os.environ["RANK"])
-        if args.multiprocessing_distributed:
-            # For multiprocessing distributed training, rank needs to be the
-            # global rank among all the processes
-            args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
         models.__dict__[args.arch],
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
+        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp,
+        dist=False)
     print(model)
 
-    if args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            model.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    # load from pre-trained, before DistributedDataParallel constructor
+    if args.pretrained:
+        if os.path.isfile(args.pretrained):
+            print("=> loading checkpoint '{}'".format(args.pretrained))
+            checkpoint = torch.load(args.pretrained, map_location="cpu")
+
+            # rename moco pre-trained keys
+            state_dict = checkpoint['state_dict']
+            for k in list(state_dict.keys()):
+                # retain only encoder_q up to before the embedding layer
+                if k.startswith('module'):# and not k.startswith('module.encoder_q.fc'):
+                    # remove prefix
+                    state_dict[k[len("module."):]] = state_dict[k]
+                # delete renamed or unused k
+                del state_dict[k]
+
+            args.start_epoch = 0
+            msg = model.load_state_dict(state_dict, strict=False)
+            assert not any(['encoder_q' in k for k in set(msg.missing_keys)]), 'missing encoder_q keys!'
+
+            print("=> loaded pre-trained model '{}'".format(args.pretrained))
         else:
-            model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
-            model = torch.nn.parallel.DistributedDataParallel(model)
-    elif args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
-        # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
-    else:
-        # AllGather implementation (batch shuffle, queue update, etc.) in
-        # this code only supports DistributedDataParallel.
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+            print("=> no checkpoint found at '{}'".format(args.pretrained))
+
+    torch.cuda.set_device(args.gpu)
+    model = model.cuda(args.gpu)
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
@@ -196,28 +194,10 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
+    traindir = os.path.join(args.data) #, 'train')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     if args.aug_plus:
@@ -243,36 +223,19 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize
         ]
+    plain = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), normalize])
 
     train_dataset = datasets.ImageFolder(
         traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
+        moco.loader.TwoCropsTransform(transforms.Compose(augmentation), orig_transform=plain))
+    train_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
-
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
-
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+    # train for one epoch
+    train(train_loader, model, criterion, optimizer, 0, args)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -289,18 +252,35 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     # switch to train mode
     model.train()
 
+    f1 = []
+    f2 = []
+    idxs = []
+
+    X_ = []
+    X1 = []
+    X2 = []
+
     end = time.time()
+    n = 0
     for i, (images, _) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
+        X1 += [images[0]]
+        X2 += [images[1]]
+        X_ += [images[2]]
+
         if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            q_img = images[2].cuda(args.gpu, non_blocking=True)
+            k_img = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output, target = model(im_q=images[0], im_k=images[1])
+        output, target, q, k = model(im_q=q_img, im_k=k_img, return_feats=True)
         loss = criterion(output, target)
+
+        f1.append(q.cpu().detach())
+        f2.append(k.cpu().detach())
+        idxs.append(torch.arange(0, q.shape[0]))
 
         # acc1/acc5 are (K+1)-way contrast classifier accuracy
         # measure accuracy and record loss
@@ -309,17 +289,294 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         top1.update(acc1[0], images[0].size(0))
         top5.update(acc5[0], images[0].size(0))
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+        n += images[0].shape[0]
+
+        if n > 2e4:
+            break
+
+        torch.cuda.empty_cache()
+
+    idxs = torch.cat(idxs+idxs, dim=0)
+    f = torch.cat(f1+f2, dim=0)
+    X12 = torch.cat(X1+X2, dim=0)
+
+    # Z = torch.cat(X_ + X_, dim=0)
+    X1, X2 = torch.cat(X1), torch.cat(X2)
+
+
+
+    show_augs(torch.cat(X_), X1, X2)
+    # xray(model, X1, X2, f1, f2)
+    # do_pca(f, X12, idxs)
+
+    ## noaug
+    do_pca(torch.cat(f1), torch.cat(X_), idxs[:idxs.shape[0]//2], args.name + '_noaug')
+    do_pca(torch.cat(f2), X2, idxs[idxs.shape[0]//2:], args.name + '_aug')
+    do_pca(f,  X12, idxs, args.name + '_noplusaug')
+    
+def show_augs(X, X1, X2):
+    import visdom
+    import torchvision
+
+    vis = visdom.Visdom(port=8095, env='moco_augs')
+    vis.close()
+
+    unnorm = lambda x: (x - x.min()) / (x - x.min()).max()
+    X, X1, X2 = unnorm(X), unnorm(X1), unnorm(X2)
+
+    for i in range(min(X.shape[0], 20)):
+        vis.images(torch.stack([X[i], X1[i], X2[i]]))
+
+class L2Normalize(torch.nn.Module):
+    def forward(self, x):
+        return torch.nn.functional.normalize(x, dim=1) / 0.07
+
+def xray(model, X1, X2, Q, K):
+    import visdom
+    import torchvision
+    import cv2
+    from torchray.attribution.grad_cam import grad_cam
+    from torchray.attribution.excitation_backprop import contrastive_excitation_backprop, excitation_backprop
+    from torchray.attribution.rise import rise
+    from torchray.attribution.deconvnet import deconvnet
+    from torchray.benchmark import get_example_data, plot_example
+    from torchray.attribution.extremal_perturbation import extremal_perturbation, contrastive_reward
+
+    from torchray.utils import imsc
+    from matplotlib import cm
+    color = cm.get_cmap('jet')
+
+    vis = visdom.Visdom(port=8095, env='moco_xray')
+    vis.close()
+
+
+    def do_saliency(x, k, one_vs_all=False):
+        head = torch.nn.Linear(k.shape[-1], k.shape[-2], bias=False)
+        head.weight.data[:] = k.data[:]
+        head = head.cuda()
+
+        contrast_model = torch.nn.Sequential(
+            model.encoder_q,
+            L2Normalize(),
+            head,
+            torch.nn.Softmax(dim=-1))
+
+        x = x.cuda()
+
+        def colorize(saliency):
+            resized = cv2.resize(
+                    saliency.permute(0,2,3,1)[0].detach().cpu().numpy(),
+                    (x.shape[-2], x.shape[-1]), interpolation=cv2.INTER_LANCZOS4) * 255
+                    
+            # import pdb; pdb.set_trace() #* 255.
+
+            # import pdb; pdb.set_trace()
+            return color(resized)[..., :3]
+            # return np.stack([resized]*3, axis=-1)
+            # return np.stack([resized]*3, dim=-1)
+
+        def _saliency(x, func):
+            s = []
+            for i in range(x.shape[0]):
+                saliency = func(contrast_model, x[i][None].cuda(), i)
+                # import pdb; pdb.set_trace()
+                saliency = colorize(saliency)
+                s.append(saliency)
+            return np.stack(s).transpose(0, -1, 1, 2)     
+
+        def gcam(m, x, i):
+            g = grad_cam(m, x, i, saliency_layer=model.encoder_q.layer4)
+            return g
+        
+        def gcam_l3(m, x, i):
+            return grad_cam(m, x, i, saliency_layer=model.encoder_q.layer3)
+
+        def excite_c1(m, x, i):
+            saliency = excitation_backprop(m, x, i, saliency_layer=model.encoder_q.conv1)  
+            saliency = imsc(saliency[0], quiet=True)[0][None]
+
+            return saliency
+
+        def excite_l1(m, x, i):
+            saliency = excitation_backprop(m, x, i, saliency_layer=model.encoder_q.layer1)  
+            saliency = imsc(saliency[0], quiet=True)[0][None]
+
+            return saliency
+
+        def ceb(m, x, i):
+            # Contrastive excitation backprop.
+            return contrastive_excitation_backprop(m, x, i,
+                saliency_layer=model.encoder_q.layer2[-1],
+                contrast_layer=model.encoder_q.layer4[-1],
+                classifier_layer=model.encoder_q.fc[-1]
+            )
+
+        def ep(area):
+            def _ep(m, x, i):
+                # Extremal perturbation backprop.
+                masks_1, _ = extremal_perturbation(
+                    m, x, i,
+                    reward_func=contrastive_reward,
+                    debug=True,
+                    areas=[area],
+                )
+                masks_1 = imsc(masks_1[0], quiet=True)[0][None]
+
+                return masks_1
+            return _ep
+        
+        def decnn(m, x, i):
+            saliency = deconvnet(m, x, i)
+            saliency = imsc(saliency[0], quiet=True)[0][None]
+
+            return saliency
+
+
+
+        if one_vs_all:
+            '''
+            compare first x to all k
+            '''
+            import time
+
+            assert x.shape[0] == 1, 'expected just one instance'
+
+            t0 = time.time()
+            rise_saliency = rise(contrast_model, x).transpose(0, 1)
+            print('rise took ************', time.time() - t0)
+
+            rise_saliency = torch.stack([imsc(rs, quiet=True)[0] for rs in rise_saliency])
+            # import pdb; pdb.set_trace()
+
+            # rise_saliency = np.stack([colorize(rs[None]) for rs in rise_saliency])
+            rise_saliency = np.stack([rise_saliency.detach().cpu().numpy()] * 3, axis=-1)[:, 0]
+            # import pdb; pdb.set_trace()
+
+            rise_saliency = rise_saliency.transpose(0,-1,1,2)
+
+            # gcam_saliency = 
+
+            return dict(
+                # rise=rise_saliency,
+                # grad_cam=_saliency(torch.cat([x]*k.shape[0]), gcam),
+            )            
+            
+        else:
+            out = dict(
+                grad_cam=_saliency(x, gcam),
+                # grad_cam_l3=_saliency(x, gcam_l3),
+                # contrastive_excitation_backprop=saliency(x, ceb),
+
+                # excite_c1=_saliency(x, excite_c1),
+                # excite_l1=_saliency(x, excite_l1),
+                # deconvnet=_saliency(x, decnn),
+                # rise=rise_saliency
+            )
+
+            for k_ep in [0.05]:#, 0.05, 0.12]:
+                out['extremal_perturbation_%s' % k_ep] = _saliency(x, ep(k_ep))
+            
+            return out
+
+    bsz = 5
+    for b in range(0, len(X1), bsz):
+        x1, x2, q, k = X1[b:b+bsz], X2[b:b+bsz], Q[b:b+bsz], K[b:b+bsz]
+        x1, x2, q, k = (torch.cat(xx) for xx in (x1, x2, q, k))
+
+        unnorm = lambda x: (x - x.min()) / (x - x.min()).max() # * 255.0
+        _x1, _x2 = unnorm(x1), unnorm(x2)
+
+        x1, x2 = _x1[:2], _x2[:2]
+        S1 = do_saliency(x1, k)
+        S2 = do_saliency(x2, q)
+
+        for name in S1:
+            s1, s2 = torch.from_numpy(S1[name]).float(), torch.from_numpy(S2[name]).float()
+            row = [x1, s1, s2, x2]
+
+            out = torch.stack(row, dim=1)
+            out = out.reshape(-1, *out.shape[-3:])
+            vis.images(out, nrow=len(row), opts=dict(title=name))
+
+
+        x1, x2 = _x1, _x2
+
+        S_one_v_all = do_saliency(x1[0][None], k, one_vs_all=True)
+
+        for name in S_one_v_all:
+            s1 = torch.from_numpy(S_one_v_all[name]).float()
+            # import pdb; pdb.set_trace()
+
+            row = [torch.stack([x1[0]]*s1.shape[0]), s1, x2]
+
+            out = torch.stack(row, dim=1)
+            out = out.reshape(-1, *out.shape[-3:])
+            vis.images(out, nrow=len(row), opts=dict(title='one-vs-all-%s' % name))
+
+        # import pdb; pdb.set_trace()
+
+
+        vis.text('', opts=dict(height=1, width=10000))
+
+    return
+
+
+def do_pca(f, X, idxs, name=''):    
+    from sklearn.decomposition import PCA, FastICA
+    import visdom
+    import torchvision
+
+    vis = visdom.Visdom(port=8095, env='moco_nn_%s' % name)
+    vis.close()
+
+    # idxs = torch.cat(idxs+idxs, dim=0)
+    # f = torch.cat(f1+f2, dim=0)
+    # X = torch.cat(X1+X2, dim=0)
+
+    D = torch.matmul(f,  f.t())
+    X -= X.min(); X /= X.max()
+
+    # f1 = torch.cat(f1, dim=0)
+    # f2 = torch.cat(f2, dim=0)
+
+    ########################### PCA ###########################
+    K = 50
+    # # pca = PCA(n_components=K, svd_solver='auto', whiten=False)
+    # pca = FastICA(n_components=K, whiten=False)
+
+    # import pdb; pdb.set_trace()
+
+    # p_f = pca.fit_transform(f.numpy())
+
+    # l = []
+    # import math
+    # step = math.ceil(p_f.shape[0]/300)
+    # i_f = np.argsort(p_f, axis=0)[::step]
+
+    # for k in range(0, K):
+    #     vis.image(torchvision.utils.make_grid(X[i_f[:, k]], nrow=10, padding=2, pad_value=0).cpu().numpy(),
+    #         opts=dict(title='Component %s' % k))
+
+    # vis.text('NN', opts=dict(width=1000, h=1))
+
+
+    # import pdb; pdb.set_trace()
+
+    ########################### NN  ###########################
+    V, I = torch.topk(D, 50, dim=-1)
+
+    for _k in range(K):
+        k = np.random.randint(X.shape[0])
+        vis.image(torchvision.utils.make_grid(X[I[k]], nrow=10, padding=2, pad_value=0).cpu().numpy(),
+            opts=dict(title='Example %s' % k))
+
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

@@ -1,14 +1,14 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import torch
 import torch.nn as nn
-
+import moco.masker
 
 class MoCo(nn.Module):
     """
     Build a MoCo model with: a query encoder, a key encoder, and a queue
     https://arxiv.org/abs/1911.05722
     """
-    def __init__(self, base_encoder, masker, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, dist=True, masker=None):
         """
         dim: feature dimension (default: 128)
         K: queue size; number of negative keys (default: 65536)
@@ -20,6 +20,9 @@ class MoCo(nn.Module):
         self.K = K
         self.m = m
         self.T = T
+        self.dist = dist
+
+        print(K, m, T)
 
         # create the encoders
         # num_classes is the output fc dimension
@@ -33,17 +36,19 @@ class MoCo(nn.Module):
 
         self.masker = masker
 
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.copy_(param_q.data)  # initialize
-            param_k.requires_grad = False  # not update by gradient
+        self._reinit_encoder_k()
 
         # create the queue
-        # print(K)
-
         self.register_buffer("queue", torch.randn(dim, K))
         self.queue = nn.functional.normalize(self.queue, dim=0)
 
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+    @torch.no_grad()
+    def _reinit_encoder_k(self):
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
 
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
@@ -55,8 +60,9 @@ class MoCo(nn.Module):
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys):
-        # gather keys before updating queue
-        keys = concat_all_gather(keys)
+        if self.dist:
+            # gather keys before updating queue
+            keys = concat_all_gather(keys)
 
         batch_size = keys.shape[0]
 
@@ -64,7 +70,7 @@ class MoCo(nn.Module):
         assert self.K % batch_size == 0  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
-        self.queue[:, ptr:ptr + batch_size] = keys.T
+        self.queue[:, ptr:ptr + batch_size] = keys.T if hasattr(keys, 'T') else keys.t()
         ptr = (ptr + batch_size) % self.K  # move pointer
 
         self.queue_ptr[0] = ptr
@@ -116,7 +122,7 @@ class MoCo(nn.Module):
 
         return x_gather[idx_this]
 
-    def forward(self, im_q, im_k):
+    def forward(self, im_q, im_k, return_feats=False):
         """
         Input:
             im_q: a batch of query images
@@ -133,14 +139,16 @@ class MoCo(nn.Module):
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
 
-            # shuffle for making use of BN
-            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+            if self.dist:
+                # shuffle for making use of BN
+                im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
             k = self.encoder_k(im_k)  # keys: NxC
             k = nn.functional.normalize(k, dim=1)
 
-            # undo shuffle
-            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+            if self.dist:
+                # undo shuffle
+                k = self._batch_unshuffle_ddp(k, idx_unshuffle)
 
         # compute logits
         # Einstein sum is more intuitive
@@ -161,12 +169,18 @@ class MoCo(nn.Module):
         # dequeue and enqueue
         self._dequeue_and_enqueue(k)
 
-        # mask stuff
-        masks, logits_m, m_aux_loss = self.masker(q, k)
-        logits_m = torch.cat([logits_m[:, None], l_pos], dim=1)
-        labels_m = torch.zeros(logits_m.shape[0], dtype=torch.long).cuda()
+        if self.masker is not None:
+            # # mask stuff
+            masks, logits_m, m_aux_loss = self.masker(q, k)
+            logits_m = torch.cat([logits_m[:, None], l_pos], dim=1)
+            labels_m = torch.zeros(logits_m.shape[0], dtype=torch.long).cuda()
 
-        return logits, labels, (logits_m, labels_m, masks, m_aux_loss)
+            return logits, labels, (logits_m, labels_m, masks, m_aux_loss)
+
+        if return_feats:
+            return logits, labels, q, k
+
+        return logits, labels
 
 # utils
 @torch.no_grad()

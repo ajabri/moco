@@ -26,6 +26,9 @@ import moco.loader
 import moco.builder
 import moco.masker
 
+import sys
+
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -106,6 +109,9 @@ parser.add_argument('--mask_mode', type=str, default='bilinear')
 parser.add_argument('--visualize', action='store_true', default=False)
 parser.add_argument('--xray', action='store_true', default=False)
 
+parser.add_argument('--pretrained', default='', type=str, metavar='PATH',
+                    help='path to an encoder checkpoint (will do filtered state_dict load) (default: none)')
+
 
 def main():
     args = parser.parse_args()
@@ -163,7 +169,7 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
-    
+
     masker = moco.masker.Masker(
         args.moco_dim,
         100,
@@ -174,10 +180,39 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
         models.__dict__[args.arch],
-        masker,
         dim=args.moco_dim, K=args.moco_k, m=args.moco_m, T=args.moco_t, mlp=args.mlp,
-        )
+        masker=masker,
+        dist=False)
+
     print(model)
+
+    # load from pre-trained, before DistributedDataParallel constructor
+    if args.pretrained:
+        if os.path.isfile(args.pretrained):
+            print("=> loading checkpoint '{}'".format(args.pretrained))
+            checkpoint = torch.load(args.pretrained, map_location="cpu")
+
+            # rename moco pre-trained keys
+            state_dict = checkpoint['state_dict']
+            for k in list(state_dict.keys()):
+                # retain only encoder_q up to before the embedding layer
+                if k.startswith('module'):# and not k.startswith('module.encoder_q.fc'):
+                    # remove prefix
+                    state_dict[k[len("module."):]] = state_dict[k]
+                # delete renamed or unused k
+                del state_dict[k]
+
+            args.start_epoch = 0
+
+            msg = model.load_state_dict(state_dict, strict=False)
+            assert not any(['encoder_q' in k for k in set(msg.missing_keys)]), 'missing encoder_q keys!'
+
+            model._reinit_encoder_k()
+            # import pdb; pdb.set_trace()
+
+            print("=> loaded pre-trained model '{}'".format(args.pretrained))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.pretrained))
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -210,7 +245,11 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    # optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    #                             momentum=args.momentum,
+    #                             weight_decay=args.weight_decay)
+
+    optimizer = torch.optim.SGD(masker.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -226,6 +265,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 checkpoint = torch.load(args.resume, map_location=loc)
             args.start_epoch = checkpoint['epoch']
             model.load_state_dict(checkpoint['state_dict'])
+
+            mdict, cdict = model.state_dict().keys(), checkpoint['state_dict'].keys()
+            print('notin 1', [k for k in mdict if k not in cdict])
+            print('notin 2', [k for k in cdict if k not in mdict])
+            
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -238,10 +282,13 @@ def main_worker(gpu, ngpus_per_node, args):
     traindir = os.path.join(args.data, 'train')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
+
+    cropsize = 256
+
     if args.aug_plus:
         # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
         augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+            transforms.RandomResizedCrop(cropsize, scale=(0.2, 1.)),
             transforms.RandomApply([
                 transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
             ], p=0.8),
@@ -254,7 +301,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
         augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+            transforms.RandomResizedCrop(cropsize, scale=(0.2, 1.)),
             transforms.RandomGrayscale(p=0.2),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
             transforms.RandomHorizontalFlip(),
@@ -321,6 +368,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # compute output
         output, target, (output_m, target_m, masks, maloss) = \
             model(im_q=images[0], im_k=images[1])
+        # output, target = model(im_q=images[0], im_k=images[1])
 
         # output and target are lists of pairs
         loss = criterion(output, target)
