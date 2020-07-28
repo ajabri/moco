@@ -11,6 +11,7 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -21,12 +22,14 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import resnet
 
 import moco.loader
 import moco.builder
-import moco.masker
+import moco.modulate
 
 import sys
+import numpy as np
 
 
 model_names = sorted(name for name in models.__dict__
@@ -112,6 +115,15 @@ parser.add_argument('--xray', action='store_true', default=False)
 parser.add_argument('--pretrained', default='', type=str, metavar='PATH',
                     help='path to an encoder checkpoint (will do filtered state_dict load) (default: none)')
 
+parser.add_argument('--image_size', type=int, default=224)
+
+parser.add_argument('--name', default='', type=str,
+                    help='path to moco pretrained checkpoint')
+
+
+import moco.utils as utils
+import wandb
+import torchvision
 
 def main():
     args = parser.parse_args()
@@ -129,6 +141,8 @@ def main():
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
+
+    # wandb.init(project="unrel", group="debug", notes=args.name)
 
     if args.dist_url == "env://" and args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
@@ -170,17 +184,19 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
-    masker = moco.masker.Masker(
-        args.moco_dim,
-        100,
+    masker = moco.modulate.Instance(
+        inp_dim=2048, #args.moco_dim,
+        H=100,
+        out_dim=args.moco_dim,
         mode=args.mask_mode,
         nonlin=args.maloss_mode)
 
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
-        models.__dict__[args.arch],
-        dim=args.moco_dim, K=args.moco_k, m=args.moco_m, T=args.moco_t, mlp=args.mlp,
+        getattr(resnet, args.arch),
+        dim=args.moco_dim, 
+        K=args.moco_k, m=args.moco_m, T=args.moco_t, mlp=args.mlp,
         masker=masker,
         dist=False)
 
@@ -244,14 +260,15 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    kl_criterion = nn.KLDivLoss(reduction='batchmean').cuda(args.gpu)
 
-    # optimizer = torch.optim.SGD(model.parameters(), args.lr,
-    #                             momentum=args.momentum,
-    #                             weight_decay=args.weight_decay)
-
-    optimizer = torch.optim.SGD(masker.parameters(), args.lr,
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
+
+    # optimizer = torch.optim.SGD(masker.parameters(), args.lr,
+    #                             momentum=args.momentum,
+    #                             weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -283,7 +300,7 @@ def main_worker(gpu, ngpus_per_node, args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    cropsize = 256
+    cropsize = args.image_size
 
     if args.aug_plus:
         # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
@@ -322,13 +339,17 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    # vis = utils.Visualize(args)
+    # vis.vis.close()
+    
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
+
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, kl_criterion, optimizer, epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -340,7 +361,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, kl_criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -353,10 +374,15 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         [batch_time, data_time, losses, top1, top5, mlosses, malosses],
         prefix="Epoch: [{}]".format(epoch))
 
+
     # switch to train mode
     model.train()
 
     end = time.time()
+
+    strip = lambda x: x.detach().cpu()
+    fq, fk, x1, x2, mm = [], [], [], [], []
+
     for i, (images, _) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -366,7 +392,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output, target, (output_m, target_m, masks, maloss) = \
+        output, target, (output_m, target_m, masks, maloss), q, k, mq, mk = \
             model(im_q=images[0], im_k=images[1])
         # output, target = model(im_q=images[0], im_k=images[1])
 
@@ -377,14 +403,20 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images[0].size(0))
-        top1.update(acc1[0], images[0].size(0))
-        top5.update(acc5[0], images[0].size(0))
+        top1.update(acc1[0].item(), images[0].size(0))
+        top5.update(acc5[0].item(), images[0].size(0))
 
         if args.mloss_coef > 0:
-            mloss = criterion(output_m, target_m)
+            if target_m.ndim == 1:
+                mloss = criterion(output_m, target_m)
+            else:
+                output_m = torch.nn.functional.softmax(output_m, dim=-1).log()
+                # assert all(target_m.sum(-1) == 1)
+                mloss = kl_criterion(output_m, target_m)
             mlosses.update(mloss.item())
             malosses.update(maloss.item())
 
+            # import pdb; pdb.set_trace()
             loss += args.mloss_coef * mloss + args.maloss_coef * maloss
 
         # compute gradient and do SGD step
@@ -398,6 +430,69 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            if i > 50:
+                wandb.log(
+                    dict(
+                        loss=loss.item(),
+                        top1=acc1[0].item(), top5=acc5[0].item(),
+                        mloss=mloss.item(), maloss=maloss.item(),
+                    )
+                )
+
+        if len(fq) < 10:
+            # visualize
+            fq += [strip(q)]
+            fk += [strip(k)]
+            mm += [strip(masks)]
+            x1 += [strip(images[0])]
+            x2 += [strip(images[1])]
+
+    # [(print(m.avg)) for m in progress.meters[:]]
+    # [(vis.log(m.name, m.avg)) for m in progress.meters[:]]
+    # vis.vis.text('', opts=dict(width=10000, height=1), win='metric_header')
+
+    
+    if ((epoch+1) % 1) == 0:
+        masker = model.masker if not hasattr(model, 'module') else model.module.masker
+    
+        fq, fk, mm, x1, x2 = (torch.cat(_, dim=0) for _ in (fq, fk, mm, x1, x2))
+        
+        # VISUALIZE NN
+        nvis_q, nvis_k = 2, 4
+        nnn = 18
+        for i in range(nvis_q):
+            D = [strip(torch.einsum('ik,jk->ij', (fq[i][None],  fk)))]
+
+            ids = torch.argsort(D[0], descending=True).squeeze()
+
+            uncond_img = torch.cat([x1[i][None], x1[i][None]*0, x2[ids[:nnn]]])
+            uncond_img -= uncond_img.min(); uncond_img /= uncond_img.max()
+            uncond_img = torchvision.utils.make_grid(uncond_img, nrow=10, padding=2, pad_value=0)
+
+            wandb.log({'nn %s' % (i): [wandb.Image(uncond_img)]})
+
+            ids = ids[:nvis_k]
+            m, m_aux_loss, _, _ = masker(fq[i][None].cuda(), fk[ids].cuda())
+
+            # conditoined lookups: select a random query, select
+            for n, j in enumerate(ids):
+                _fq = F.normalize(masker.condition(fq[i][None].cuda(), m[n].cuda()))
+                _fk = fk.cuda()
+                # _fk = F.normalize(masker.condition(fk.cuda(), m[n].cuda()))
+
+                D += [strip(torch.einsum('ij,kj->ik', _fq, _fk))]
+                _D, I = torch.sort(D[-1], descending=True, axis=-1)
+
+                # import pdb; pdb.set_trace()
+
+                nn_img = torch.cat([x1[i][None], x2[j][None], x2[I[0,:nnn]]])
+                nn_img -= nn_img.min(); nn_img /= nn_img.max()
+                nn_img = torchvision.utils.make_grid(nn_img, nrow=10, padding=2, pad_value=0)
+                wandb.log({
+                    'nn %s:%s' % (i,n): [wandb.Image(nn_img)]
+                })
+                # vis.vis.bar(_D[0][::-1][:20], opts=dict(height=150, width=500), win='patch_affinity_%s_%s' % (n, i))
+            
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

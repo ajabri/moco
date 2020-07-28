@@ -105,6 +105,9 @@ parser.add_argument('--pretrained', default='', type=str,
 parser.add_argument('--name', default='', type=str,
                     help='path to moco pretrained checkpoint')
 
+parser.add_argument('--nvis', default=2e4, type=int,
+                    help='number of images to use in visualization')
+
 def main():
     args = parser.parse_args()
 
@@ -298,7 +301,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         n += images[0].shape[0]
 
-        if n > 2e4:
+        if n > args.nvis:
             break
 
         torch.cuda.empty_cache()
@@ -307,19 +310,20 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     f = torch.cat(f1+f2, dim=0)
     X12 = torch.cat(X1+X2, dim=0)
 
+    xray(model, X1, X2, f1, f2)
+    # do_pca(f, X12, idxs)
+
     # Z = torch.cat(X_ + X_, dim=0)
     X1, X2 = torch.cat(X1), torch.cat(X2)
 
+    import pdb; pdb.set_trace()
 
-
-    show_augs(torch.cat(X_), X1, X2)
-    # xray(model, X1, X2, f1, f2)
-    # do_pca(f, X12, idxs)
+    # show_augs(torch.cat(X_), X1, X2)
 
     ## noaug
-    do_pca(torch.cat(f1), torch.cat(X_), idxs[:idxs.shape[0]//2], args.name + '_noaug')
-    do_pca(torch.cat(f2), X2, idxs[idxs.shape[0]//2:], args.name + '_aug')
-    do_pca(f,  X12, idxs, args.name + '_noplusaug')
+    # do_pca(torch.cat(f1), torch.cat(X_), idxs[:idxs.shape[0]//2], args.name + '_noaug')
+    # do_pca(torch.cat(f2), X2, idxs[idxs.shape[0]//2:], args.name + '_aug')
+    # do_pca(f,  X12, idxs, args.name + '_noplusaug')
     
 def show_augs(X, X1, X2):
     import visdom
@@ -418,6 +422,9 @@ def xray(model, X1, X2, Q, K):
                 classifier_layer=model.encoder_q.fc[-1]
             )
 
+            # import excitationbp as eb
+
+
         def ep(area):
             def _ep(m, x, i):
                 # Extremal perturbation backprop.
@@ -470,9 +477,9 @@ def xray(model, X1, X2, Q, K):
             
         else:
             out = dict(
-                grad_cam=_saliency(x, gcam),
+                # grad_cam=_saliency(x, gcam),
                 # grad_cam_l3=_saliency(x, gcam_l3),
-                # contrastive_excitation_backprop=saliency(x, ceb),
+                contrastive_excitation_backprop=_saliency(x, ceb),
 
                 # excite_c1=_saliency(x, excite_c1),
                 # excite_l1=_saliency(x, excite_l1),
@@ -506,19 +513,19 @@ def xray(model, X1, X2, Q, K):
             vis.images(out, nrow=len(row), opts=dict(title=name))
 
 
-        x1, x2 = _x1, _x2
+        # x1, x2 = _x1, _x2
 
-        S_one_v_all = do_saliency(x1[0][None], k, one_vs_all=True)
+        # S_one_v_all = do_saliency(x1[0][None], k, one_vs_all=True)
 
-        for name in S_one_v_all:
-            s1 = torch.from_numpy(S_one_v_all[name]).float()
-            # import pdb; pdb.set_trace()
+        # for name in S_one_v_all:
+        #     s1 = torch.from_numpy(S_one_v_all[name]).float()
+        #     # import pdb; pdb.set_trace()
 
-            row = [torch.stack([x1[0]]*s1.shape[0]), s1, x2]
+        #     row = [torch.stack([x1[0]]*s1.shape[0]), s1, x2]
 
-            out = torch.stack(row, dim=1)
-            out = out.reshape(-1, *out.shape[-3:])
-            vis.images(out, nrow=len(row), opts=dict(title='one-vs-all-%s' % name))
+        #     out = torch.stack(row, dim=1)
+        #     out = out.reshape(-1, *out.shape[-3:])
+        #     vis.images(out, nrow=len(row), opts=dict(title='one-vs-all-%s' % name))
 
         # import pdb; pdb.set_trace()
 
