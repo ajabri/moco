@@ -120,6 +120,7 @@ parser.add_argument('--image_size', type=int, default=224)
 parser.add_argument('--name', default='', type=str,
                     help='path to moco pretrained checkpoint')
 
+parser.add_argument('--use-same-head', action='store_true', default=False)
 
 import moco.utils as utils
 import wandb
@@ -142,7 +143,7 @@ def main():
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
 
-    # wandb.init(project="unrel", group="debug", notes=args.name)
+    wandb.init(project="unrel", group="debug", notes=args.name)
 
     if args.dist_url == "env://" and args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
@@ -186,7 +187,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     masker = moco.modulate.Instance(
         inp_dim=2048, #args.moco_dim,
-        H=100,
+        H=10 if args.mask_mode == 'bilinear' else 100,
         out_dim=args.moco_dim,
         mode=args.mask_mode,
         nonlin=args.maloss_mode)
@@ -199,6 +200,9 @@ def main_worker(gpu, ngpus_per_node, args):
         K=args.moco_k, m=args.moco_m, T=args.moco_t, mlp=args.mlp,
         masker=masker,
         dist=False)
+
+    if args.use_same_head:
+        masker.head = model.encoder_q.fc
 
     print(model)
 
@@ -439,60 +443,80 @@ def train(train_loader, model, criterion, kl_criterion, optimizer, epoch, args):
                     )
                 )
 
-        if len(fq) < 10:
+        if len(fq) < 20:
             # visualize
             fq += [strip(q)]
             fk += [strip(k)]
             mm += [strip(masks)]
             x1 += [strip(images[0])]
             x2 += [strip(images[1])]
-
-    # [(print(m.avg)) for m in progress.meters[:]]
-    # [(vis.log(m.name, m.avg)) for m in progress.meters[:]]
-    # vis.vis.text('', opts=dict(width=10000, height=1), win='metric_header')
-
-    
-    if ((epoch+1) % 1) == 0:
-        masker = model.masker if not hasattr(model, 'module') else model.module.masker
-    
-        fq, fk, mm, x1, x2 = (torch.cat(_, dim=0) for _ in (fq, fk, mm, x1, x2))
-        
-        # VISUALIZE NN
-        nvis_q, nvis_k = 2, 4
-        nnn = 18
-        for i in range(nvis_q):
-            D = [strip(torch.einsum('ik,jk->ij', (fq[i][None],  fk)))]
-
-            ids = torch.argsort(D[0], descending=True).squeeze()
-
-            uncond_img = torch.cat([x1[i][None], x1[i][None]*0, x2[ids[:nnn]]])
-            uncond_img -= uncond_img.min(); uncond_img /= uncond_img.max()
-            uncond_img = torchvision.utils.make_grid(uncond_img, nrow=10, padding=2, pad_value=0)
-
-            wandb.log({'nn %s' % (i): [wandb.Image(uncond_img)]})
-
-            ids = ids[:nvis_k]
-            m, m_aux_loss, _, _ = masker(fq[i][None].cuda(), fk[ids].cuda())
-
-            # conditoined lookups: select a random query, select
-            for n, j in enumerate(ids):
-                _fq = F.normalize(masker.condition(fq[i][None].cuda(), m[n].cuda()))
-                _fk = fk.cuda()
-                # _fk = F.normalize(masker.condition(fk.cuda(), m[n].cuda()))
-
-                D += [strip(torch.einsum('ij,kj->ik', _fq, _fk))]
-                _D, I = torch.sort(D[-1], descending=True, axis=-1)
-
-                # import pdb; pdb.set_trace()
-
-                nn_img = torch.cat([x1[i][None], x2[j][None], x2[I[0,:nnn]]])
-                nn_img -= nn_img.min(); nn_img /= nn_img.max()
-                nn_img = torchvision.utils.make_grid(nn_img, nrow=10, padding=2, pad_value=0)
-                wandb.log({
-                    'nn %s:%s' % (i,n): [wandb.Image(nn_img)]
-                })
-                # vis.vis.bar(_D[0][::-1][:20], opts=dict(height=150, width=500), win='patch_affinity_%s_%s' % (n, i))
             
+
+        # [(print(m.avg)) for m in progress.meters[:]]
+        # [(vis.log(m.name, m.avg)) for m in progress.meters[:]]
+        # vis.vis.text('', opts=dict(width=10000, height=1), win='metric_header')
+
+        elif ((epoch+1) % 1) == 0 and ((i+1) % 1000) == 0:
+            masker = model.masker if not hasattr(model, 'module') else model.module.masker
+            encoder = model.encoder_q if not hasattr(model, 'module') else model.module.encoder_q
+
+            head = encoder.fc.cpu()
+            masker = masker.cpu()
+
+            fq_hid, fk_hid, mm, x1, x2 = (torch.cat(_, dim=0) for _ in (fq, fk, mm, x1, x2))
+            
+            # import pdb; pdb.set_trace()
+
+            # VISUALIZE NN
+            nvis_q, nvis_k = 2, 4
+            nnn = 18
+
+            fq, fk = head(fq_hid), head(fk_hid)
+
+            for i in range(nvis_q):
+                # fq, fk = head(fq_hid), head(fk_hid)
+
+                D = [strip(torch.einsum('ik,jk->ij', (fq[i][None],  fk)))]
+
+                ids = torch.argsort(D[0], descending=True).squeeze()
+
+                uncond_img = torch.cat([x1[i][None], x1[i][None]*0, x2[ids[:nnn]]])
+                uncond_img -= uncond_img.min(); uncond_img /= uncond_img.max()
+                uncond_img = torchvision.utils.make_grid(uncond_img, nrow=10, padding=2, pad_value=0)
+
+                wandb.log({'nn %s' % (i): [wandb.Image(uncond_img)]})
+
+                ids = ids[:nvis_k]
+                fk_hids = fk_hid[ids]
+                m, m_aux_loss, _, _ = masker(fq_hid[i][None].expand_as(fk_hids), fk_hids)
+
+                # conditoined lookups: select a random query, select
+                for n, j in enumerate(ids):
+                    _fq = F.normalize(masker.condition(fq_hid[i][None], m[n]))
+                    _fk = fk
+                    # _fk = F.normalize(masker.condition(fk.cuda(), m[n].cuda()))
+
+                    D += [strip(torch.einsum('ij,kj->ik', _fq, _fk))]
+                    _D, I = torch.sort(D[-1], descending=True, axis=-1)
+
+                    # import pdb; pdb.set_trace()
+
+                    nn_img = torch.cat([x1[i][None], x2[j][None], x2[I[0,:nnn]]])
+                    nn_img -= nn_img.min(); nn_img /= nn_img.max()
+                    nn_img = torchvision.utils.make_grid(nn_img, nrow=10, padding=2, pad_value=0)
+                    wandb.log({
+                        'nn %s:%s' % (i,n): [wandb.Image(nn_img)]
+                    })
+                    # vis.vis.bar(_D[0][::-1][:20], opts=dict(height=150, width=500), win='patch_affinity_%s_%s' % (n, i))
+
+            encoder.fc = encoder.fc.cuda()
+            masker = masker.cuda()
+
+            fq = []
+            fk = []
+            mm = []
+            x1 = []
+            x2 = []
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

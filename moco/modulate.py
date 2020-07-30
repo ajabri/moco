@@ -24,13 +24,15 @@ sys.excepthook = info
 class Bilinear(nn.Module):
     def __init__(self, inp_dim, H):
         super(Bilinear, self).__init__()
-        self.w = nn.Bilinear(inp_dim, inp_dim, H, bias=True)
+        self.map = nn.Linear(inp_dim, 128)
+        self.w = nn.Bilinear(128, 128, H, bias=True)
 
     def forward(self, x12):
         # import pdb; pdb.set_trace()
         L = x12.shape[-1]//2
         # return torch.einsum('ij,kjl,il->ik', x12[:, :L], self.W, x12[:, L:])
-        return self.w(x12[:, :L], x12[:, L:])
+
+        return self.w(self.map(x12[:, :L]), self.map(x12[:, L:]))
 
 # class Bilinear(nn.Module):
 #     def __init__(self, inp_dim, H):
@@ -40,7 +42,6 @@ class Bilinear(nn.Module):
 #     def forward(self, x12):
 #         L = x12.shape[-1]//2
 #         return torch.einsum('ij,kjl,il->ik', x12[:, :L], self.W, x12[:, L:])
-
 
 class Inferer(nn.Module):
     def __init__(self, inp_dim, out_dim, H, mode):
@@ -103,6 +104,11 @@ class Inferer(nn.Module):
         else:
             if self.mode == 'class':
                 m = F.softmax(m, dim=-1) / 0.05
+
+            # elif self.mode == 'bilinear':
+                # m = 
+                # import pdb; pdb.set_trace()
+
             # elif self.mode == 'argmax':
             #     import pdb; pdb.set_trace()
             #     m = torch.topk(m, dim=-1)
@@ -151,6 +157,7 @@ class Modulator(nn.Module):
 
         if self.nonlin == 'softmax':
             m = F.softmax(m, dim=-1)
+
         elif hasattr(F, self.nonlin):
             m = getattr(F, self.nonlin)(m)
             # print(m)
@@ -170,6 +177,7 @@ class Modulator(nn.Module):
             return torch.norm(n_m, dim=-1, p=2).mean()
 
         elif self.prior == 'l1':
+            # import pdb; pdb.set_trace()
             return torch.norm(n_m, dim=-1, p=1).mean()
 
         elif self.prior == 'kl':
@@ -184,7 +192,7 @@ class Modulator(nn.Module):
 
 
 class Symmetric(Modulator):
-    def __init__(self, inp_dim, H, out_dim, mode='bilinear', nonlin='none', prior='l1'):
+    def __init__(self, inp_dim, H, out_dim, mode='bilinear', nonlin='none', prior='l2'):
         super(Instance, self).__init__(inp_dim, 2, H, out_dim, mode=mode, nonlin=nonlin, prior=prior)
 
     def forward(self, q, k):
@@ -200,12 +208,17 @@ class Symmetric(Modulator):
         return n_m, aux_loss, mq, mk
 
 class Instance(Modulator):
-    def __init__(self, inp_dim, H, mode='class', nonlin='none', prior='l1'):
-        super(Instance, self).__init__(inp_dim, 1, H, out_dim, mode=mode, nonlin=nonlin, prior=prior)
+    def __init__(self, inp_dim, H, out_dim, mode='class', nonlin='none', prior='l2'):
+        n_inp = 2 if mode == 'bilinear' else 1
+        super(Instance, self).__init__(inp_dim, n_inp, H, out_dim, mode=mode, nonlin=nonlin, prior=prior)
 
     def forward(self, q, k):
-        k = q-k
-        m = self.g(k)
+        if self.mode == 'bilinear':
+            m = self.g([q, k])
+        else:
+            k = q-k
+            m = self.g(k)
+
         n_m = self.apply_nonlin(m)
 
         aux_loss = self.aux_loss(n_m, m)

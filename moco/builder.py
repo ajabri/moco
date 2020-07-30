@@ -272,6 +272,7 @@ class MoCo(nn.Module):
                 # q_nn = q_fc[:, None].expand_as(k_nn)            # expanded query embeddings
 
                 k_nn = self.queue_2[:, ids_nn].permute(1,2,0)       # neighbour embeddings
+                k_nn_norm = queue_norm[:, ids_nn].permute(1,2,0)
                 q_nn = q_hid[:, None].expand_as(k_nn)            # expanded query embeddings
 
                 ########################################################################
@@ -297,7 +298,8 @@ class MoCo(nn.Module):
 
                 # q|pi v.s. pj
                 # import pdb; pdb.set_trace()
-                logits_q_pi__pj = torch.einsum('njc,nlc->njl', q_p, nn.functional.normalize(k_nn, dim=-1)).flatten(0, 1)
+                logits_q_pi__pj = torch.einsum('njc,nlc->njl', q_p, k_nn_norm).flatten(0, 1)
+                # logits_q_pi__pj = torch.einsum('njc,nlc->njl', q_p, nn.functional.normalize(k_nn, dim=-1)).flatten(0, 1)
                 pos_logits.append(logits_q_pi__pj[:, 0:1])
                 neg_logits.append(logits_q_pi__pj[:, 1:])
 
@@ -330,7 +332,7 @@ class MoCo(nn.Module):
             self._dequeue_and_enqueue(k_fc)
             self._dequeue_and_enqueue_2(k_hid)
 
-            return logits, labels, (logits_m, labels_m, masks, m_aux_loss), q, k, q_p, k_p
+            return logits, labels, (logits_m, labels_m, masks, m_aux_loss), q_hid, k_hid, q_p, k_p
 
         
         # dequeue and enqueue
